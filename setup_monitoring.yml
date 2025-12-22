@@ -1,0 +1,566 @@
+---
+- name: Setup Local Monitoring in Kind Cluster
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  become: false
+  vars:
+    kind_cluster_name: "monitoring-cluster"
+    monitoring_namespace: "monitoring"
+    server_ip: "192.168.50.100"
+    # Set to true only if you explicitly want Ansible to change host iptables backend / restart Docker.
+    # When true, run the playbook with `-K` (ask become pass).
+    host_docker_fix: false
+
+  tasks:
+    - name: Check for iptables-legacy binary
+      ansible.builtin.stat:
+        path: /usr/sbin/iptables-legacy
+      register: iptables_legacy
+      changed_when: false
+
+    - name: Check for ip6tables-legacy binary
+      ansible.builtin.stat:
+        path: /usr/sbin/ip6tables-legacy
+      register: ip6tables_legacy
+      changed_when: false
+
+    - name: Check whether sudo can run non-interactively (for optional host fix)
+      ansible.builtin.command: "sudo -n true"
+      register: sudo_noninteractive
+      changed_when: false
+      failed_when: false
+      when: host_docker_fix | bool
+
+    - name: Abort early if optional host fix needs a become password
+      ansible.builtin.fail:
+        msg: >-
+          host_docker_fix=true requires sudo, but sudo cannot run non-interactively in this session.
+          Re-run with `ansible-playbook setup_monitoring.yml -e host_docker_fix=true -K` and enter your sudo password.
+      when:
+        - host_docker_fix | bool
+        - sudo_noninteractive.rc != 0
+        - ansible_become_pass is not defined
+
+    - name: Prefer iptables legacy backend (optional host fix)
+      ansible.builtin.command: "update-alternatives --set iptables /usr/sbin/iptables-legacy"
+      become: true
+      when:
+        - host_docker_fix | bool
+        - ansible_facts.os_family == 'Debian'
+        - iptables_legacy.stat.exists
+
+    - name: Prefer ip6tables legacy backend (optional host fix)
+      ansible.builtin.command: "update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy"
+      become: true
+      when:
+        - host_docker_fix | bool
+        - ansible_facts.os_family == 'Debian'
+        - ip6tables_legacy.stat.exists
+
+    - name: Restart Docker (optional host fix)
+      ansible.builtin.service:
+        name: docker
+        state: restarted
+      become: true
+      when: host_docker_fix | bool
+
+    - name: Check Docker is reachable
+      ansible.builtin.command: "docker info"
+      register: docker_info
+      changed_when: false
+      failed_when: docker_info.rc != 0
+
+    - name: Docker networking preflight (bridge create/remove)
+      ansible.builtin.shell: |
+        set -euo pipefail
+        docker network create ansible-kind-preflight >/dev/null
+        docker network rm ansible-kind-preflight >/dev/null
+      args:
+        executable: /bin/bash
+      register: docker_net_preflight
+      changed_when: false
+      failed_when: false
+
+    - name: Abort if Docker cannot manage bridge networks
+      ansible.builtin.fail:
+        msg: |-
+          Docker networking is broken on this host, so Kind cannot create its Docker network.
+
+          docker stderr:
+          {{ docker_net_preflight.stderr | default('') }}
+
+          docker stdout:
+          {{ docker_net_preflight.stdout | default('') }}
+
+          If you see DOCKER-ISOLATION/iptables errors, fix Docker+iptables on the host first
+          (common Ubuntu/Debian fix: switch iptables to legacy and restart Docker), or rerun with
+          `-e host_docker_fix=true` (run `sudo -v` first).
+      when: docker_net_preflight.rc != 0
+
+    - name: Check if Kind cluster exists
+      ansible.builtin.command: "kind get clusters"
+      register: kind_clusters
+      changed_when: false
+
+    - name: Cleanup stale Kind network
+      ansible.builtin.command: "docker network rm kind"
+      when: kind_cluster_name not in kind_clusters.stdout
+      failed_when: false
+      changed_when: false
+
+    - name: Pre-create Kind network (standard IPv4 to avoid iptables errors)
+      ansible.builtin.command: "docker network create -d bridge kind"
+      when: kind_cluster_name not in kind_clusters.stdout
+      # If this fails, the next task will likely fail too, but it's worth a try
+      ignore_errors: true
+
+    - name: Create Kind cluster if not exists
+      ansible.builtin.shell: |
+        cat <<EOF | kind create cluster --name {{ kind_cluster_name }} --config=-
+        kind: Cluster
+        apiVersion: kind.x-k8s.io/v1alpha4
+        networking:
+          ipFamily: ipv4
+          apiServerAddress: "127.0.0.1"
+        EOF
+      when: kind_cluster_name not in kind_clusters.stdout
+      register: cluster_creation
+
+    - name: Wait for Kind cluster to be ready
+      ansible.builtin.command: "kubectl cluster-info"
+      register: cluster_ready
+      until: cluster_ready.rc == 0
+      retries: 20
+      delay: 5
+      when: cluster_creation is changed
+
+    - name: Ensure kubectl is using the Kind context
+      ansible.builtin.command: "kubectl config use-context kind-{{ kind_cluster_name }}"
+      changed_when: false
+
+    - name: Check whether cluster DNS has ready endpoints (kube-dns)
+      ansible.builtin.command: "kubectl -n kube-system get endpoints kube-dns -o jsonpath='{.subsets}'"
+      register: kube_dns_subsets
+      changed_when: false
+
+    - name: Abort if cluster DNS/service routing is broken (kube-dns has no endpoints)
+      ansible.builtin.fail:
+        msg: |
+          kube-dns has no ready endpoints. This usually means kube-proxy is down, so ClusterIP services and DNS will time out.
+
+          Symptoms you will see:
+            - Grafana datasource error: dial tcp: lookup prometheus-service.monitoring.svc.cluster.local: i/o timeout
+
+          Common cause on Linux desktops:
+            - kube-proxy crashlooping with "too many open files" due to low inotify instance limit.
+
+          Fix on the host (requires sudo):
+            sudo sysctl -w fs.inotify.max_user_instances=1024
+
+          Then restart in-cluster networking components:
+            kubectl -n kube-system delete pod -l k8s-app=kube-proxy
+            kubectl -n kube-system delete pod -l k8s-app=kube-dns
+
+          Verify:
+            kubectl -n kube-system get endpoints kube-dns -o wide
+      when:
+        - kube_dns_subsets.stdout | trim in ['', 'null', '[]']
+
+    - name: Pre-pull monitoring images on the host
+      ansible.builtin.command: "docker pull {{ item }}"
+      loop:
+        - grafana/grafana-oss:latest
+        - prom/prometheus:latest
+      changed_when: false
+
+    - name: Load monitoring images into Kind (avoid in-cluster Docker Hub pulls)
+      ansible.builtin.command: "kind load docker-image --name {{ kind_cluster_name }} {{ item }}"
+      loop:
+        - grafana/grafana-oss:latest
+        - prom/prometheus:latest
+      changed_when: false
+
+    - name: Deploy monitoring manifests (namespace, Prometheus, Grafana, services)
+      ansible.builtin.shell: |
+        set -euo pipefail
+        kubectl apply -f - <<'YAML'
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: {{ monitoring_namespace }}
+        YAML
+
+        kubectl apply -f - <<'YAML'
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: prometheus-config
+          namespace: {{ monitoring_namespace }}
+        data:
+          prometheus.yml: |
+            global:
+              scrape_interval: 5s
+            scrape_configs:
+              - job_name: 'go-srv'
+                static_configs:
+                  - targets: ['{{ server_ip }}:9100']
+        YAML
+
+        kubectl apply -f - <<'YAML'
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: grafana-provisioning-datasources
+          namespace: {{ monitoring_namespace }}
+        data:
+          datasources.yaml: |
+            apiVersion: 1
+            datasources:
+              - name: Prometheus
+                uid: prometheus
+                type: prometheus
+                access: proxy
+                url: http://prometheus-service.{{ monitoring_namespace }}.svc.cluster.local:9090
+                isDefault: true
+        YAML
+
+        kubectl apply -f - <<'YAML'
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: grafana-provisioning-dashboards
+          namespace: {{ monitoring_namespace }}
+        data:
+          dashboards.yaml: |
+            apiVersion: 1
+            providers:
+              - name: default
+                orgId: 1
+                folder: ""
+                type: file
+                disableDeletion: true
+                editable: true
+                options:
+                  path: /var/lib/grafana/dashboards
+        YAML
+
+        kubectl apply -f - <<'YAML'
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: grafana-dashboard-node-exporter
+          namespace: {{ monitoring_namespace }}
+        data:
+          node-exporter.json: |
+            {
+              "annotations": {
+                "list": [
+                  {
+                    "builtIn": 1,
+                    "datasource": {"type": "grafana", "uid": "-- Grafana --"},
+                    "enable": true,
+                    "hide": true,
+                    "iconColor": "rgba(0, 211, 255, 1)",
+                    "name": "Annotations & Alerts",
+                    "type": "dashboard"
+                  }
+                ]
+              },
+              "editable": true,
+              "fiscalYearStartMonth": 0,
+              "graphTooltip": 0,
+              "id": null,
+              "links": [],
+              "panels": [
+                {
+                  "datasource": {"type": "prometheus", "uid": "prometheus"},
+                  "fieldConfig": {"defaults": {"unit": "percent"}, "overrides": []},
+                  "gridPos": {"h": 8, "w": 8, "x": 0, "y": 0},
+                  "id": 1,
+                  "options": {"legend": {"displayMode": "table", "placement": "bottom"}},
+                  "targets": [
+                    {
+                      "expr": "100 - (avg by (instance, cpu) (rate(node_cpu_seconds_total{mode=\"idle\"}[$__rate_interval])) * 100)",
+                      "legendFormat": "{{ '{{instance}}' }} cpu{{ '{{cpu}}' }}",
+                      "refId": "A"
+                    }
+                  ],
+                  "title": "CPU Usage % (by core)",
+                  "type": "timeseries"
+                },
+                {
+                  "datasource": {"type": "prometheus", "uid": "prometheus"},
+                  "fieldConfig": {"defaults": {"unit": "bytes"}, "overrides": []},
+                  "gridPos": {"h": 8, "w": 8, "x": 8, "y": 0},
+                  "id": 2,
+                  "options": {"legend": {"displayMode": "table", "placement": "bottom"}},
+                  "targets": [
+                    {
+                      "expr": "node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes",
+                      "legendFormat": "Used ({{ '{{instance}}' }})",
+                      "refId": "A"
+                    },
+                    {
+                      "expr": "node_memory_MemAvailable_bytes",
+                      "legendFormat": "Available ({{ '{{instance}}' }})",
+                      "refId": "B"
+                    }
+                  ],
+                  "title": "Memory (used vs available)",
+                  "type": "timeseries"
+                },
+                {
+                  "datasource": {"type": "prometheus", "uid": "prometheus"},
+                  "fieldConfig": {"defaults": {"unit": "bytes"}, "overrides": []},
+                  "gridPos": {"h": 8, "w": 8, "x": 16, "y": 0},
+                  "id": 3,
+                  "options": {"legend": {"displayMode": "table", "placement": "bottom"}},
+                  "targets": [
+                    {
+                      "expr": "sum by (instance) (rate(node_network_receive_bytes_total{device!~\"lo\"}[$__rate_interval]))",
+                      "legendFormat": "RX {{ '{{instance}}' }}",
+                      "refId": "A"
+                    },
+                    {
+                      "expr": "sum by (instance) (rate(node_network_transmit_bytes_total{device!~\"lo\"}[$__rate_interval]))",
+                      "legendFormat": "TX {{ '{{instance}}' }}",
+                      "refId": "B"
+                    }
+                  ],
+                  "title": "Network (RX/TX)",
+                  "type": "timeseries"
+                },
+                {
+                  "datasource": {"type": "prometheus", "uid": "prometheus"},
+                  "fieldConfig": {"defaults": {"unit": "bytes"}, "overrides": []},
+                  "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+                  "id": 4,
+                  "options": {"legend": {"displayMode": "table", "placement": "bottom"}},
+                  "targets": [
+                    {
+                      "expr": "topk(5, sum by (instance, mountpoint) (node_filesystem_size_bytes{fstype!~\"tmpfs|overlay\", mountpoint!~\"/var/lib/docker.*\"} - node_filesystem_free_bytes{fstype!~\"tmpfs|overlay\", mountpoint!~\"/var/lib/docker.*\"}))",
+                      "legendFormat": "{{ '{{instance}}' }} {{ '{{mountpoint}}' }}",
+                      "refId": "A"
+                    }
+                  ],
+                  "title": "Disk Used (top 5 mounts)",
+                  "type": "timeseries"
+                },
+                {
+                  "datasource": {"type": "prometheus", "uid": "prometheus"},
+                  "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+                  "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+                  "id": 5,
+                  "options": {"legend": {"displayMode": "table", "placement": "bottom"}},
+                  "targets": [
+                    {
+                      "expr": "node_time_seconds - node_boot_time_seconds",
+                      "legendFormat": "{{ '{{instance}}' }}",
+                      "refId": "A"
+                    }
+                  ],
+                  "title": "Uptime",
+                  "type": "timeseries"
+                },
+                {
+                  "datasource": {"type": "prometheus", "uid": "prometheus"},
+                  "fieldConfig": {"defaults": {"unit": "celsius"}, "overrides": []},
+                  "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+                  "id": 6,
+                  "options": {"legend": {"displayMode": "table", "placement": "bottom"}},
+                  "targets": [
+                    {
+                      "expr": "max by (instance, chip, sensor) (node_hwmon_temp_celsius{chip=~\".*(coretemp|k10temp|zenpower).*\"})",
+                      "legendFormat": "{{ '{{instance}}' }} {{ '{{chip}}' }} {{ '{{sensor}}' }}",
+                      "refId": "A"
+                    },
+                    {
+                      "expr": "max by (instance, zone, type) (node_thermal_zone_temp{type=~\".*(x86_pkg_temp|cpu|CPU|pkg).*\"})",
+                      "legendFormat": "{{ '{{instance}}' }} {{ '{{type}}' }}",
+                      "refId": "B"
+                    }
+                  ],
+                  "title": "CPU Temperature",
+                  "type": "timeseries"
+                },
+                {
+                  "datasource": {"type": "prometheus", "uid": "prometheus"},
+                  "fieldConfig": {"defaults": {"unit": "celsius"}, "overrides": []},
+                  "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
+                  "id": 7,
+                  "options": {"legend": {"displayMode": "table", "placement": "bottom"}},
+                  "targets": [
+                    {
+                      "expr": "max by (instance, chip, sensor) (node_hwmon_temp_celsius{chip=~\".*nvme.*\"})",
+                      "legendFormat": "{{ '{{instance}}' }} {{ '{{chip}}' }} {{ '{{sensor}}' }}",
+                      "refId": "A"
+                    }
+                  ],
+                  "title": "NVMe Temperature",
+                  "type": "timeseries"
+                },
+                {
+                  "datasource": {"type": "prometheus", "uid": "prometheus"},
+                  "fieldConfig": {"defaults": {"unit": "celsius"}, "overrides": []},
+                  "gridPos": {"h": 8, "w": 24, "x": 0, "y": 24},
+                  "id": 9,
+                  "options": {"legend": {"displayMode": "table", "placement": "bottom"}},
+                  "targets": [
+                    {
+                      "expr": "max by (instance, chip, sensor) (node_hwmon_temp_celsius{chip=~\".*wmi_bus.*\"})",
+                      "legendFormat": "{{ '{{instance}}' }} {{ '{{sensor}}' }}",
+                      "refId": "A"
+                    }
+                  ],
+                  "title": "EC Temperature",
+                  "type": "timeseries"
+                },
+                {
+                  "datasource": {"type": "prometheus", "uid": "prometheus"},
+                  "fieldConfig": {"defaults": {"unit": "celsius"}, "overrides": []},
+                  "gridPos": {"h": 8, "w": 24, "x": 0, "y": 32},
+                  "id": 8,
+                  "options": {"legend": {"displayMode": "table", "placement": "bottom"}},
+                  "targets": [
+                    {
+                      "expr": "max by (instance, chip, sensor) (node_hwmon_temp_celsius) unless on (instance, chip, sensor) node_hwmon_temp_celsius{sensor=~\".*(Tctl|Tdie|CPU|Package|Core|DIMM|Mem|MEM|Memory|DDR|DRAM|RAM).*\"}",
+                      "legendFormat": "{{ '{{instance}}' }} {{ '{{chip}}' }} {{ '{{sensor}}' }}",
+                      "refId": "A"
+                    },
+                    {
+                      "expr": "max by (instance, zone, type) (node_thermal_zone_temp) unless on (instance, zone, type) (node_thermal_zone_temp{type=~\".*(x86_pkg_temp|cpu|CPU|pkg).*\"})",
+                      "legendFormat": "{{ '{{instance}}' }} zone{{ '{{zone}}' }} {{ '{{type}}' }}",
+                      "refId": "B"
+                    }
+                  ],
+                  "title": "Other Temperatures (NVMe/Chipset/VRM/etc)",
+                  "type": "timeseries"
+                }
+              ],
+              "refresh": "10s",
+              "schemaVersion": 39,
+              "tags": ["node-exporter"],
+              "templating": {"list": []},
+              "time": {"from": "now-15m", "to": "now"},
+              "timepicker": {},
+              "timezone": "browser",
+              "title": "Node Exporter (go-srv)",
+              "uid": "node-exporter-go-srv",
+              "version": 1
+            }
+        YAML
+
+        kubectl apply -f - <<'YAML'
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: prometheus
+          namespace: {{ monitoring_namespace }}
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: prometheus
+          template:
+            metadata:
+              labels:
+                app: prometheus
+            spec:
+              containers:
+                - name: prometheus
+                  image: prom/prometheus:latest
+                  imagePullPolicy: IfNotPresent
+                  ports:
+                    - containerPort: 9090
+                  volumeMounts:
+                    - name: config-volume
+                      mountPath: /etc/prometheus/prometheus.yml
+                      subPath: prometheus.yml
+              volumes:
+                - name: config-volume
+                  configMap:
+                    name: prometheus-config
+        YAML
+
+        kubectl apply -f - <<'YAML'
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: grafana
+          namespace: {{ monitoring_namespace }}
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: grafana
+          template:
+            metadata:
+              labels:
+                app: grafana
+            spec:
+              containers:
+                - name: grafana
+                  image: grafana/grafana-oss:latest
+                  imagePullPolicy: IfNotPresent
+                  ports:
+                    - containerPort: 3000
+                  env:
+                    - name: GF_AUTH_ANONYMOUS_ENABLED
+                      value: "true"
+                    - name: GF_AUTH_ANONYMOUS_ORG_ROLE
+                      value: "Admin"
+                  volumeMounts:
+                    - name: grafana-provisioning-datasources
+                      mountPath: /etc/grafana/provisioning/datasources
+                      readOnly: true
+                    - name: grafana-provisioning-dashboards
+                      mountPath: /etc/grafana/provisioning/dashboards
+                      readOnly: true
+                    - name: grafana-dashboards
+                      mountPath: /var/lib/grafana/dashboards
+                      readOnly: true
+              volumes:
+                - name: grafana-provisioning-datasources
+                  configMap:
+                    name: grafana-provisioning-datasources
+                - name: grafana-provisioning-dashboards
+                  configMap:
+                    name: grafana-provisioning-dashboards
+                - name: grafana-dashboards
+                  configMap:
+                    name: grafana-dashboard-node-exporter
+        YAML
+
+        kubectl apply -f - <<'YAML'
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: prometheus-service
+          namespace: {{ monitoring_namespace }}
+        spec:
+          selector:
+            app: prometheus
+          ports:
+            - protocol: TCP
+              port: 9090
+              targetPort: 9090
+        YAML
+
+        kubectl apply -f - <<'YAML'
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: grafana-service
+          namespace: {{ monitoring_namespace }}
+        spec:
+          selector:
+            app: grafana
+          ports:
+            - protocol: TCP
+              port: 3000
+              targetPort: 3000
+        YAML
+      args:
+        executable: /bin/bash
+      changed_when: false
