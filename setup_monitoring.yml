@@ -8,11 +8,34 @@
     kind_cluster_name: "monitoring-cluster"
     monitoring_namespace: "monitoring"
     server_ip: "192.168.50.100"
+    ingress_host: "grafana.local"
+    prometheus_ingress_host: "prometheus.local"
+    ingress_hosts:
+      - "{{ ingress_host }}"
+      - "{{ prometheus_ingress_host }}"
+    manage_hosts_entry: false
     # Set to true only if you explicitly want Ansible to change host iptables backend / restart Docker.
     # When true, run the playbook with `-K` (ask become pass).
     host_docker_fix: false
 
   tasks:
+    - name: Prompt for sudo password (only for /etc/hosts edit)
+      ansible.builtin.pause:
+        prompt: "Enter sudo password to modify /etc/hosts (leave empty to skip)"
+        echo: no
+      register: become_pass_input
+      when:
+        - manage_hosts_entry | bool
+        - ansible_become_pass is not defined
+
+    - name: Set become password fact from prompt
+      ansible.builtin.set_fact:
+        ansible_become_pass: "{{ become_pass_input.user_input }}"
+        ansible_become_password: "{{ become_pass_input.user_input }}"
+      when:
+        - manage_hosts_entry | bool
+        - ansible_become_pass is not defined
+        - become_pass_input is defined
     - name: Check for iptables-legacy binary
       ansible.builtin.stat:
         path: /usr/sbin/iptables-legacy
@@ -120,6 +143,21 @@
         cat <<EOF | kind create cluster --name {{ kind_cluster_name }} --config=-
         kind: Cluster
         apiVersion: kind.x-k8s.io/v1alpha4
+        nodes:
+        - role: control-plane
+          kubeadmConfigPatches:
+          - |
+            kind: InitConfiguration
+            nodeRegistration:
+              kubeletExtraArgs:
+                node-labels: "ingress-ready=true"
+          extraPortMappings:
+          - containerPort: 80
+            hostPort: 80
+            protocol: TCP
+          - containerPort: 443
+            hostPort: 443
+            protocol: TCP
         networking:
           ipFamily: ipv4
           apiServerAddress: "127.0.0.1"
@@ -137,6 +175,65 @@
 
     - name: Ensure kubectl is using the Kind context
       ansible.builtin.command: "kubectl config use-context kind-{{ kind_cluster_name }}"
+      changed_when: false
+
+    - name: Check if ingress host already present in /etc/hosts (non-comment)
+      ansible.builtin.shell: |
+        set -euo pipefail
+        grep -E '(^|[[:space:]]){{ item | regex_escape }}([[:space:]]|$)' /etc/hosts | grep -vq '^[[:space:]]*#'
+      args:
+        executable: /bin/bash
+      loop: "{{ ingress_hosts }}"
+      register: hosts_entry_present
+      changed_when: false
+      failed_when: false
+      when: manage_hosts_entry | bool
+
+    - name: Append ingress hosts with sudo -S (no Ansible become)
+      ansible.builtin.shell: |
+        set -euo pipefail
+        pw="{{ _pw }}"
+        printf '%s\n' "$pw" | sudo -S sh -c "printf '%s\n' '127.0.0.1 {{ item.item }}' >> /etc/hosts"
+      args:
+        executable: /bin/bash
+      vars:
+        _pw: "{{ ansible_become_pass | default(ansible_become_password | default(become_pass_input.user_input | default(''))) }}"
+      loop: "{{ hosts_entry_present.results }}"
+      no_log: true
+      when:
+        - manage_hosts_entry | bool
+        - item.rc != 0
+      register: hosts_append
+      changed_when: hosts_append.rc is defined and hosts_append.rc == 0
+
+    - name: Install ingress-nginx (Kind provider manifest)
+      ansible.builtin.command: >-
+        kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml
+      register: ingress_nginx_apply
+      changed_when: ingress_nginx_apply.stdout is search('created|configured')
+
+    - name: Wait for ingress-nginx namespace to exist
+      ansible.builtin.command: kubectl get namespace ingress-nginx
+      register: ingress_nginx_ns
+      until: ingress_nginx_ns.rc == 0
+      retries: 30
+      delay: 2
+      changed_when: false
+
+    - name: Wait for ingress-nginx controller rollout
+      ansible.builtin.command: kubectl -n ingress-nginx rollout status deployment/ingress-nginx-controller --timeout=180s
+      register: ingress_nginx_controller_rollout
+      until: ingress_nginx_controller_rollout.rc == 0
+      retries: 6
+      delay: 10
+      changed_when: false
+
+    - name: Wait for ingress-nginx admission service endpoints
+      ansible.builtin.command: kubectl -n ingress-nginx get endpoints ingress-nginx-controller-admission -o jsonpath='{.subsets}'
+      register: ingress_nginx_admission_endpoints
+      until: ingress_nginx_admission_endpoints.stdout | trim not in ['', 'null', '[]']
+      retries: 60
+      delay: 2
       changed_when: false
 
     - name: Check whether cluster DNS has ready endpoints (kube-dns)
@@ -563,4 +660,68 @@
         YAML
       args:
         executable: /bin/bash
+      changed_when: false
+
+    - name: Create Grafana Ingress
+      ansible.builtin.shell: |
+        set -euo pipefail
+
+        kubectl apply -f - <<'YAML'
+        apiVersion: networking.k8s.io/v1
+        kind: Ingress
+        metadata:
+          name: grafana-ingress
+          namespace: {{ monitoring_namespace }}
+        spec:
+          ingressClassName: nginx
+          rules:
+          - host: {{ ingress_host }}
+            http:
+              paths:
+              - path: /
+                pathType: Prefix
+                backend:
+                  service:
+                    name: grafana-service
+                    port:
+                      number: 3000
+        YAML
+      args:
+        executable: /bin/bash
+      register: grafana_ingress_apply
+      until: grafana_ingress_apply.rc == 0
+      retries: 30
+      delay: 2
+      changed_when: false
+
+    - name: Create Prometheus Ingress
+      ansible.builtin.shell: |
+        set -euo pipefail
+
+        kubectl apply -f - <<'YAML'
+        apiVersion: networking.k8s.io/v1
+        kind: Ingress
+        metadata:
+          name: prometheus-ingress
+          namespace: {{ monitoring_namespace }}
+        spec:
+          ingressClassName: nginx
+          rules:
+          - host: {{ prometheus_ingress_host }}
+            http:
+              paths:
+              - path: /
+                pathType: Prefix
+                backend:
+                  service:
+                    name: prometheus-service
+                    port:
+                      number: 9090
+        YAML
+      args:
+        executable: /bin/bash
+      register: prometheus_ingress_apply
+      until: prometheus_ingress_apply.rc == 0
+      retries: 30
+      delay: 2
       changed_when: false
