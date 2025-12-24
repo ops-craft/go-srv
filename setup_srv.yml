@@ -133,14 +133,42 @@
         name: bottom
         classic: yes
 
-    # --- 3. KIND SETUP ---
+    # --- 3. ACT (GitHub Actions runner) ---
+    - name: Check if act is already installed
+      ansible.builtin.stat:
+        path: /usr/local/bin/act
+      register: act_bin
+
+    - name: Download act installer script
+      ansible.builtin.get_url:
+        url: https://raw.githubusercontent.com/nektos/act/master/install.sh
+        dest: /tmp/act-install.sh
+        mode: '0755'
+      when: not act_bin.stat.exists
+
+    - name: Run act installer script
+      ansible.builtin.command: bash /tmp/act-install.sh
+      args:
+        chdir: /tmp
+        creates: /tmp/bin/act
+      when: not act_bin.stat.exists
+
+    - name: Move act binary to /usr/local/bin
+      ansible.builtin.copy:
+        src: /tmp/bin/act
+        dest: /usr/local/bin/act
+        mode: '0755'
+        remote_src: true
+      when: not act_bin.stat.exists
+
+    # --- 4. KIND SETUP ---
     - name: Download Kind binary
       get_url:
         url: "https://kind.sigs.k8s.io/dl/{{ kind_version }}/kind-linux-amd64"
         dest: /usr/local/bin/kind
         mode: '0755'
 
-    # --- 4. SYSTEM LIMITS (For Kind) ---
+    # --- 5. SYSTEM LIMITS (For Kind) ---
     - name: Increase inotify limits for Kind clusters
       sysctl:
         name: "{{ item.name }}"
