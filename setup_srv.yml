@@ -143,7 +143,7 @@
       ansible.builtin.get_url:
         url: https://raw.githubusercontent.com/nektos/act/master/install.sh
         dest: /tmp/act-install.sh
-        mode: '0755'
+        mode: '0700'
       when: not act_bin.stat.exists
 
     - name: Run act installer script
@@ -157,7 +157,9 @@
       ansible.builtin.copy:
         src: /tmp/bin/act
         dest: /usr/local/bin/act
-        mode: '0755'
+        owner: root
+        group: docker
+        mode: '0750'
         remote_src: true
       when: not act_bin.stat.exists
 
@@ -166,7 +168,9 @@
       get_url:
         url: "https://kind.sigs.k8s.io/dl/{{ kind_version }}/kind-linux-amd64"
         dest: /usr/local/bin/kind
-        mode: '0755'
+        owner: root
+        group: docker
+        mode: '0750'
 
     # --- 5. SYSTEM LIMITS (For Kind) ---
     - name: Increase inotify limits for Kind clusters
